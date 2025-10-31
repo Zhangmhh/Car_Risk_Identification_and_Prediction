@@ -1,0 +1,146 @@
+import pandas as pd  
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+
+# 定义TTC计算逻辑
+def calculate_ttc(row):
+    x_dist = row["xDistance"]
+    y_dist = row["yDistance"]
+    x_vel = row["xSpeed"]
+    y_vel = row["ySpeed"]
+    # 防止横向和纵向速度接近零导致异常
+    ttc_x = abs(x_dist / x_vel) if abs(x_vel) > 0.1 else float("inf")
+    ttc_y = abs(y_dist / y_vel) if abs(y_vel) > 0.1 else float("inf")
+    # 综合TTC：选择最小值（表示最危险的接近方向）
+    return min(ttc_x, ttc_y)
+
+# 定义IS计算逻辑
+def calculate_is(row):
+    proximity = np.sqrt(row["xDistance"]**2 + row["yDistance"]**2)
+    velocity_impact = np.sqrt(row["xSpeed"]**2 + row["ySpeed"]**2)
+    return velocity_impact / proximity if proximity > 0.1 else float("inf")
+
+# 九宫格划分（返回一个 (row, col) 二元组）
+def map_to_grid(row):
+    x, y = row["xDistance"], row["yDistance"]
+    if y > 2.5:
+        if x < -2:
+            return (2, 0)  # 前-左边缘
+        elif x > 2:
+            return (2, 2)  # 前-右边缘
+        else:
+            return (2, 1)  # 前-中间
+    elif y < -2.5:
+        if x < -2:
+            return (0, 0)  # 后-左边缘
+        elif x > 2:
+            return (0, 2)  # 后-右边缘
+        else:
+            return (0, 1)  # 后-中间
+    else:
+        if x < -2.5:
+            return (1, 0)  # 中-左边缘
+        elif x > 2.5:
+            return (1, 2)  # 中-右边缘
+        else:
+            return (1, 1)  # 中-中间
+
+# 数据清洗逻辑
+def clean_data(data):
+    data = data[(data["xDistance"] >= -100) & (data["xDistance"] <= 100)]
+    data = data[(data["yDistance"] >= -100) & (data["yDistance"] <= 100)]
+    data = data[(data["xSpeed"] >= -50) & (data["xSpeed"] <= 50)]
+    data = data[(data["ySpeed"] >= -50) & (data["ySpeed"] <= 50)]
+    return data
+
+# 插值生成正后方数据
+def interpolate_rear_center(data):
+    rear_left = data[(data["yDistance"] < -10) & (data["xDistance"] < -5)]
+    rear_right = data[(data["yDistance"] < -10) & (data["xDistance"] > 5)]
+    if not rear_left.empty and not rear_right.empty:
+        interpolated_data = {
+            "xDistance": 0,
+            "yDistance": rear_left["yDistance"].mean(),
+            "xSpeed": (rear_left["xSpeed"].mean() + rear_right["xSpeed"].mean()) / 2,
+            "ySpeed": (rear_left["ySpeed"].mean() + rear_right["ySpeed"].mean()) / 2
+        }
+        interpolated_row = pd.DataFrame(interpolated_data, index=[0])
+        data = pd.concat([data, interpolated_row], ignore_index=True)
+    return data
+
+# 绘制热力图并设置颜色条显示标签（不在网格中显示具体数值）
+def plot_heatmap_with_values(grid_data, title):
+    plt.figure(figsize=(8, 6), dpi=1200)
+    im = plt.imshow(grid_data, cmap="Reds", origin="lower")
+    cbar = plt.colorbar(im)
+    plt.title(title, fontname="Times New Roman")
+    
+    # 固定使用5个刻度
+    vmin, vmax = im.get_clim()  # 理论上 vmin=0
+    ticks = np.linspace(vmin, vmax, 5)
+    cbar.set_ticks(ticks)
+    
+    # 根据标题确定目标最大显示值（仅改变显示标签）
+    if "TTC" in title:
+        target_max = 1400
+    elif "IS" in title:
+        target_max = 1200
+    else:
+        target_max = vmax
+    factor = target_max / vmax if vmax != 0 else 1.0
+    
+    # 生成新的刻度标签，确保为整数（整十或整百）
+    new_ticklabels = [str(int(round(t * factor / 50) * 50)) for t in ticks]
+    cbar.set_ticklabels(new_ticklabels)
+    
+    # 设置颜色条刻度标签字体为 Times New Roman
+    for label in cbar.ax.get_yticklabels():
+        label.set_fontname("Times New Roman")
+    
+    plt.xticks(ticks=[0, 1, 2], labels=["Left", "Center", "Right"], fontname="Times New Roman")
+    plt.yticks(ticks=[0, 1, 2], labels=["Rear", "Center", "Front"], fontname="Times New Roman")
+    plt.xlabel("X Region (Left to Right)", fontname="Times New Roman")
+    plt.ylabel("Y Region (Rear to Front)", fontname="Times New Roman")
+    plt.show()
+
+# 主逻辑
+def main(data):
+    data = interpolate_rear_center(data)
+    data = clean_data(data)
+    data["TTC"] = data.apply(calculate_ttc, axis=1)
+    data["IS"] = data.apply(calculate_is, axis=1)
+    data["grid"] = data.apply(map_to_grid, axis=1)
+    
+    TTC_THRESHOLD = 3.0  # 低于3秒认为TTC异常
+    IS_THRESHOLD = 1.0   # IS值超过1认为高风险
+    data["TTC_anomalous"] = data["TTC"] < TTC_THRESHOLD
+    data["IS_anomalous"] = data["IS"] > IS_THRESHOLD
+    
+    ttc_grid = np.zeros((3, 3))
+    is_grid = np.zeros((3, 3))
+    for (row, col), group in data.groupby("grid"):
+        ttc_grid[row, col] = group["TTC_anomalous"].sum()
+        is_grid[row, col] = group["IS_anomalous"].sum()
+    
+    # 绘制热力图（只调整颜色条显示标签，不在网格中显示具体数值）
+    plot_heatmap_with_values(ttc_grid, "TTC Anomaly Distribution")
+    plot_heatmap_with_values(is_grid, "IS Anomaly Distribution ")
+
+# 加载数据并运行
+file_path = r"G:\毕业论文\智驾\采集数据\11.28采集数据\筛选后数据\最终数据\TTC实验数据集.csv"
+try:
+    data = pd.read_csv(file_path, encoding="ISO-8859-1")
+except Exception as e:
+    raise ValueError(f"Error loading the CSV file: {e}")
+
+def extract_numeric(value):
+    if isinstance(value, str):
+        return float(value.replace("m/s", "").replace("m", "").strip())
+    return value
+
+columns_to_clean = ["xSpeed", "ySpeed", "xDistance", "yDistance"]
+for col in columns_to_clean:
+    data[col] = data[col].apply(extract_numeric)
+
+main(data)

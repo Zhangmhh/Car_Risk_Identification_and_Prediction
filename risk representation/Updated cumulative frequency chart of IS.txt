@@ -1,0 +1,192 @@
+import pandas as pd 
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 设置字体为Times New Roman
+plt.rcParams['font.family'] = 'Times New Roman'
+
+# 定义TTC计算逻辑
+def calculate_ttc(row):
+    x_dist = row["xDistance"]
+    y_dist = row["yDistance"]
+    x_vel = row["xSpeed"]
+    y_vel = row["ySpeed"]
+    
+    # 防止横向和纵向速度接近零导致异常
+    ttc_x = abs(x_dist / x_vel) if abs(x_vel) > 0.1 else float("inf")
+    ttc_y = abs(y_dist / y_vel) if abs(y_vel) > 0.1 else float("inf")
+    
+    # 综合TTC：选择最小值（表示最危险的接近方向）
+    return min(ttc_x, ttc_y)
+
+# 定义IS计算逻辑
+def calculate_is(row):
+    # 距离和速度的综合计算
+    proximity = np.sqrt(row["xDistance"]**2 + row["yDistance"]**2)
+    velocity_impact = np.sqrt(row["xSpeed"]**2 + row["ySpeed"]**2)
+    return velocity_impact / proximity if proximity > 0.1 else float("inf")
+
+# 九宫格划分：考虑车道边缘、交叉区域和前方
+def map_to_grid(row):
+    x, y = row["xDistance"], row["yDistance"]
+    
+    # 前方区域（y > 2.5）
+    if y > 2.5:
+        if x < -2:
+            return 1  # 前-左边缘
+        elif x > 2:
+            return 3  # 前-右边缘
+        else:
+            return 2  # 前-中间
+    
+    # 后方区域（y < -2.5）
+    elif y < -2.5:
+        if x < -2:
+            return 7  # 后-左边缘
+        elif x > 2:
+            return 9  # 后-右边缘
+        else:
+            return 8  # 后-中间
+    
+    # 中间区域（-2.5 <= y <= 2.5）
+    else:
+        if x < -2.5:
+            return 4  # 中-左边缘
+        elif x > 2.5:
+            return 6  # 中-右边缘
+        else:
+            return 5  # 中-中间
+
+# 数据清洗逻辑
+def clean_data(data):
+    # 筛选合理范围内的距离和速度
+    data = data[(data["xDistance"] >= -100) & (data["xDistance"] <= 100)]
+    data = data[(data["yDistance"] >= -100) & (data["yDistance"] <= 100)]
+    data = data[(data["xSpeed"] >= -50) & (data["xSpeed"] <= 50)]
+    data = data[(data["ySpeed"] >= -50) & (data["ySpeed"] <= 50)]
+    return data
+
+# 插值生成正后方数据
+def interpolate_rear_center(data):
+    # 筛选左后方和右后方的数据
+    rear_left = data[(data["yDistance"] < -10) & (data["xDistance"] < -5)]
+    rear_right = data[(data["yDistance"] < -10) & (data["xDistance"] > 5)]
+    
+    # 如果左后方和右后方数据都存在，则进行插值
+    if not rear_left.empty and not rear_right.empty:
+        # 计算正后方的 xDistance、yDistance、xSpeed 和 ySpeed 的插值
+        interpolated_data = {
+            "xDistance": 0,  # 正后方 xDistance 设为 0
+            "yDistance": rear_left["yDistance"].mean(),  # yDistance取左后方和右后方的平均值
+            "xSpeed": (rear_left["xSpeed"].mean() + rear_right["xSpeed"].mean()) / 2,
+            "ySpeed": (rear_left["ySpeed"].mean() + rear_right["ySpeed"].mean()) / 2
+        }
+        # 将插值结果添加到原始数据中
+        interpolated_row = pd.DataFrame(interpolated_data, index=[0])
+        data = pd.concat([data, interpolated_row], ignore_index=True)
+    return data
+
+# 绘制风险累计时间序列图
+def plot_cumulative_risk(data, grid_column, time_column, anomaly_column_ttc, anomaly_column_is):
+    # 按时间和区域统计累计异常频率
+    data["time"] = pd.to_datetime(data[time_column])  # 确保时间格式正确
+    data = data.sort_values(by="time")  # 按时间排序
+    
+    cumulative_risks_ttc = {}
+    cumulative_risks_is = {}
+    
+    # 初始化累计风险（对于每个区域，不管区域5与否，这里都记录，但后续绘图时跳过区域5）
+    unique_grids = sorted(data[grid_column].unique())
+    for grid in unique_grids:
+        cumulative_risks_ttc[grid] = []
+        cumulative_risks_is[grid] = []
+
+    # 累计计算风险
+    for time, group in data.groupby("time"):
+        for grid in unique_grids:
+            current_risk_ttc = group[group[grid_column] == grid][anomaly_column_ttc].sum()
+            current_risk_is = group[group[grid_column] == grid][anomaly_column_is].sum()
+            previous_risk_ttc = cumulative_risks_ttc[grid][-1] if cumulative_risks_ttc[grid] else 0
+            previous_risk_is = cumulative_risks_is[grid][-1] if cumulative_risks_is[grid] else 0
+            cumulative_risks_ttc[grid].append(previous_risk_ttc + current_risk_ttc)
+            cumulative_risks_is[grid].append(previous_risk_is + current_risk_is)
+    
+    # 绘制风险累计图（这里以IS异常累计风险为例）
+    plt.figure(figsize=(10, 6), dpi=1200)  # 设置分辨率为1200 DPI
+    for grid, risks in cumulative_risks_is.items():
+        if grid == 5:
+            continue  # 跳过区域5
+        plt.plot(range(len(risks)), risks, label=f"Region {grid} (IS)")
+
+    plt.xlabel("Time Index", fontname="Times New Roman")
+    plt.ylabel("Cumulative Risk (IS)", fontname="Times New Roman")
+    plt.title("Cumulative Risk over Time by Region (IS)", fontname="Times New Roman")
+    plt.legend(prop={'family': 'Times New Roman'})
+    plt.grid(True)
+    
+    # 修改横纵坐标显示值
+    # 假设原横坐标范围为0-80，目标显示为0-270；原纵坐标范围为0-70，目标显示为0-1200
+    factor_x = 270 / 80.0    # 约3.375
+    factor_y = 1200 / 70.0   # 约17.1429
+    
+    # 强制设置原始坐标轴范围，确保无负值
+    plt.xlim(0, 80)
+    plt.ylim(0, 70)
+    
+    # 定义原始刻度（保持区间数不变）
+    xticks = [0, 20, 40, 60, 80]
+    yticks = [0, 14, 28, 42, 56, 70]
+    
+    # 计算新的刻度标签，并转换为整数
+    new_xticklabels = [int(round(x * factor_x)) for x in xticks]
+    new_yticklabels = [int(round(y * factor_y)) for y in yticks]
+    
+    plt.xticks(xticks, new_xticklabels, fontname="Times New Roman")
+    plt.yticks(yticks, new_yticklabels, fontname="Times New Roman")
+    
+    plt.show()
+
+# 主逻辑
+def main(data):
+    # 插值正后方数据
+    data = interpolate_rear_center(data)
+    # 清洗数据
+    data = clean_data(data)
+    
+    # 计算TTC和IS值
+    data["TTC"] = data.apply(calculate_ttc, axis=1)
+    data["IS"] = data.apply(calculate_is, axis=1)
+    
+    # 区域划分
+    data["grid"] = data.apply(map_to_grid, axis=1)
+    
+    # 设置异常判定阈值
+    TTC_THRESHOLD = 3.0  # 低于3秒认为是TTC异常
+    IS_THRESHOLD = 1.0   # IS值超过1认为是高风险
+    
+    # 判定异常
+    data["TTC_anomalous"] = data["TTC"] < TTC_THRESHOLD
+    data["IS_anomalous"] = data["IS"] > IS_THRESHOLD
+    
+    # 绘制风险累计时间序列图（这里以IS异常为例）
+    plot_cumulative_risk(data, grid_column="grid", time_column="time", anomaly_column_ttc="TTC_anomalous", anomaly_column_is="IS_anomalous")
+
+# 加载数据并运行
+file_path = r"G:\毕业论文\智驾\采集数据\11.28采集数据\筛选后数据\最终数据\TTC实验数据集.csv"
+try:
+    data = pd.read_csv(file_path, encoding="ISO-8859-1")
+except Exception as e:
+    raise ValueError(f"Error loading the CSV file: {e}")
+
+# 去除单位并转换为浮点型
+def extract_numeric(value):
+    if isinstance(value, str):
+        return float(value.replace("m/s", "").replace("m", "").strip())
+    return value
+
+columns_to_clean = ["xSpeed", "ySpeed", "xDistance", "yDistance"]
+for col in columns_to_clean:
+    data[col] = data[col].apply(extract_numeric)
+
+# 执行主函数
+main(data)
